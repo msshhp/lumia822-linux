@@ -7,12 +7,12 @@ Guide for developers and coding agents (Claude Code, Codex, ...) continuing this
 
 Working on a real RM-845 running W10M 15063: unlocked (Spec A), Volume-Down boot into Linux 7.3,
 Alpine 3.22 with persistent ext4-image root on the NTFS Data partition, USB RNDIS + ACM, SSH, mDNS
-(`lumia822.local`), Wi-Fi (WPA2) with the phone's own Riva firmware. Used as a headless home server.
+(`lumia822.local`), Wi-Fi (WPA2) with the phone's own Riva firmware, both CPU cores (parking protocol),
+PM8921 charger (4.1 V, about 7 W) and housekeeping ADC. Used as a headless home server.
 
-Not done: battery/charger (PM8921 charger + fuel gauge) - **highest priority before running 24/7**,
-backlight, buttons (Volume/Power as input), touch, SD card (SDCC3), second CPU core (SPM/SAW,
-`nosmp`), cpufreq, thermal, audio, modem, GPU, Bluetooth (channels `APPS_RIVA_BT_*` exist), clean
-upstreamable patches.
+Not done: fuel gauge (PM8921 BMS; capacity is a voltage estimate), backlight, buttons (Volume/Power
+as input), touch, SD card (SDCC3), cpufreq/cpuidle (CPU clocks as UEFI left them), thermal, audio,
+modem, GPU, Bluetooth (channels `APPS_RIVA_BT_*` exist), clean upstreamable patches.
 
 ## Access to a phone
 

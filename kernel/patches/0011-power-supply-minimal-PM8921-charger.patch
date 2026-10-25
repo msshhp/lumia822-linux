@@ -1,0 +1,539 @@
+--- a/drivers/power/supply/Kconfig
++++ b/drivers/power/supply/Kconfig
+@@ -731,6 +731,15 @@
+ 	  This driver can also be built as a module. If so, the module
+ 	  will be called "mt6370-charger".
+ 
++config CHARGER_PM8921_LITE
++	tristate "Minimal Qualcomm PM8921 charger"
++	depends on MFD_PM8XXX && IIO
++	help
++	  Programs and enables the PM8921 hardware charger state machine
++	  (charge voltage, battery and USB input current from DT) and reports
++	  battery and USB status. No fuel gauge. Used on the Nokia Lumia 822,
++	  whose firmware leaves the charger disabled.
++
+ config CHARGER_QCOM_SMBB
+ 	tristate "Qualcomm Switch-Mode Battery Charger and Boost"
+ 	depends on MFD_SPMI_PMIC || COMPILE_TEST
+--- a/drivers/power/supply/Makefile
++++ b/drivers/power/supply/Makefile
+@@ -95,6 +95,7 @@
+ obj-$(CONFIG_CHARGER_MT6360)	+= mt6360_charger.o
+ obj-$(CONFIG_CHARGER_MT6370)	+= mt6370-charger.o
+ obj-$(CONFIG_CHARGER_QCOM_SMBB)	+= qcom_smbb.o
++obj-$(CONFIG_CHARGER_PM8921_LITE)	+= pm8921-charger-lite.o
+ obj-$(CONFIG_BATTERY_PM8916_BMS_VM)	+= pm8916_bms_vm.o
+ obj-$(CONFIG_CHARGER_PM8916_LBC)	+= pm8916_lbc.o
+ obj-$(CONFIG_CHARGER_BQ2415X)	+= bq2415x_charger.o
+--- /dev/null
++++ b/drivers/power/supply/pm8921-charger-lite.c
+@@ -0,0 +1,508 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Minimal PM8921 charger driver (Nokia Lumia 822).
++ *
++ * The PM8921 charger is a hardware state machine: once programmed (charge voltage, battery current,
++ * USB input current) and enabled it does trickle, fast charge, end of charge and recharge by itself,
++ * and stops on battery over/under temperature. Windows Phone UEFI leaves it disabled, with a 100 mA
++ * USB input limit, so without this driver the phone runs from its battery even when plugged in.
++ *
++ * This driver programs the limits from DT, enables charging, clears the "charge failed" state the
++ * safety timer leaves behind (the phone stays plugged in for days), and reports battery/USB status.
++ * No fuel gauge: capacity is estimated from the battery voltage. Register map and sequences follow
++ * the downstream Code Aurora pm8921-charger.c.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/delay.h>
++#include <linux/devm-helpers.h>
++#include <linux/interrupt.h>
++#include <linux/iio/consumer.h>
++#include <linux/irq.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/power_supply.h>
++#include <linux/regmap.h>
++#include <linux/workqueue.h>
++
++#define PBL_ACCESS2		0x005
++#define  ENUM_TIMER_STOP	BIT(1)
++#define  IUSB_MASK		GENMASK(4, 2)
++#define CHG_IBAT_MAX		0x205
++#define CHG_TEST		0x206
++#define CHG_VBAT_DET		0x213
++#define CHG_CNTRL_3		0x216
++#define  CHG_EN			BIT(7)
++#define  ATC_FAILED_CLEAR	BIT(1)
++#define  CHG_FAILED_CLEAR	BIT(0)
++#define CHG_VDD_MAX		0x220
++#define CHG_VDD_SAFE		0x221
++
++#define V_MIN_MV		3240
++#define V_STEP_MV		20
++#define I_MIN_MA		225
++#define I_STEP_MA		50
++
++/* CHG_TEST: bit 7 = write, bits 6:4 = bank, bits 3:0 = data */
++#define CAPTURE_FSM_STATE	0xc2
++#define READ_BANK_4		0x40
++#define READ_BANK_7		0x70
++
++enum {
++	FSM_OFF = 0, FSM_ON_CHG_HIGHI = 1, FSM_ATC_2A = 2, FSM_ON_BAT = 3, FSM_ATC_FAIL = 4,
++	FSM_ON_CHG_AND_BAT = 6, FSM_FAST_CHG = 7, FSM_TRKL_CHG = 8, FSM_CHG_FAIL = 9, FSM_EOC = 10,
++	FSM_ATC_2B = 18,
++};
++
++#define POLL_MS			30000
++
++/*
++ * Software battery temperature limits (millidegrees C) on top of the PMIC's own hot/cold cutoff, like
++ * downstream's warm/hot handling: reduced current when warm, no charging when hot, with hysteresis.
++ */
++#define WARM_MC			45000
++#define WARM_CLEAR_MC		42000
++#define HOT_MC			50000
++#define HOT_CLEAR_MC		45000
++#define WARM_IBAT_MA		325
++enum { THERM_OK, THERM_WARM, THERM_HOT };
++
++/* USB input limits of the PM8921 (PBL_ACCESS2[4:2]), mA */
++static const int iusb_ma[] = { 100, 500, 700, 850, 900, 1100, 1300, 1500 };
++
++/* rough open-circuit voltage (mV) to capacity (%) curve of a Li-ion cell */
++static const struct { int mv, pct; } ocv[] = {
++	{ 3300, 0 }, { 3450, 5 }, { 3600, 12 }, { 3680, 20 }, { 3730, 30 }, { 3770, 40 },
++	{ 3800, 50 }, { 3840, 60 }, { 3900, 70 }, { 3970, 80 }, { 4060, 90 }, { 4180, 100 },
++};
++
++struct pm8921_chg {
++	struct device *dev;
++	struct regmap *map;
++	struct power_supply *bat;
++	struct power_supply *usb;
++	struct iio_channel *vbat;
++	struct iio_channel *therm;
++	struct delayed_work work;
++	struct mutex lock;
++	int usbin_irq;
++	u32 vdd_max_mv;
++	u32 ibat_ma;		/* programmed now */
++	u32 ibat_cfg_ma;	/* configured (DT/sysfs), used while not warm */
++	u32 iusb_idx;
++	int therm_state;
++	int fsm;
++	bool usb_online;
++};
++
++static int chg_fsm_state(struct pm8921_chg *chg)
++{
++	unsigned int lo, hi;
++	int ret;
++
++	mutex_lock(&chg->lock);
++	ret = regmap_write(chg->map, CHG_TEST, CAPTURE_FSM_STATE);
++	ret = ret ?: regmap_write(chg->map, CHG_TEST, READ_BANK_7);
++	ret = ret ?: regmap_read(chg->map, CHG_TEST, &lo);
++	ret = ret ?: regmap_write(chg->map, CHG_TEST, READ_BANK_4);
++	ret = ret ?: regmap_read(chg->map, CHG_TEST, &hi);
++	mutex_unlock(&chg->lock);
++
++	return ret ?: (lo & 0xf) | (hi & 1) << 4;
++}
++
++/* run the charger buck from the 19.2 MHz XO (needs the TCXO D0 buffer, voted in clk-rpm) */
++static int chg_force_19p2mhz_clk(struct pm8921_chg *chg)
++{
++	static const u8 seq[] = { 0xd1, 0xd3, 0xd1, 0xd5, 0, 0xd1, 0xd0, 0, 0xd1, 0xd3 };
++	int i, ret = 0;
++
++	for (i = 0; i < ARRAY_SIZE(seq) && !ret; i++) {
++		if (!seq[i])
++			udelay(200);
++		else
++			ret = regmap_write(chg->map, CHG_TEST, seq[i]);
++	}
++	return ret;
++}
++
++static int chg_set_vdd_max(struct pm8921_chg *chg, int mv)
++{
++	unsigned int val;
++	int cur, ret;
++
++	ret = regmap_read(chg->map, CHG_VDD_MAX, &val);
++	if (ret)
++		return ret;
++	cur = V_MIN_MV + (val & 0x7f) * V_STEP_MV + (val & BIT(7) ? 10 : 0);
++	cur -= (cur - V_MIN_MV) % V_STEP_MV;
++
++	/* downstream changes VDD_MAX in 20 mV steps while a charger may be connected */
++	while (cur != mv && !ret) {
++		cur += cur < mv ? V_STEP_MV : -V_STEP_MV;
++		ret = regmap_write(chg->map, CHG_VDD_MAX, (cur - V_MIN_MV) / V_STEP_MV);
++	}
++	return ret;
++}
++
++static int chg_set_ibat(struct pm8921_chg *chg, int ua)
++{
++	int ret;
++
++	chg->ibat_ma = clamp(ua / 1000, 325, 3025);
++	ret = regmap_update_bits(chg->map, CHG_IBAT_MAX, 0x3f, (chg->ibat_ma - I_MIN_MA) / I_STEP_MA);
++	chg->ibat_ma -= (chg->ibat_ma - I_MIN_MA) % I_STEP_MA;
++	return ret;
++}
++
++static int chg_set_iusb(struct pm8921_chg *chg, int ua)
++{
++	int i;
++
++	/* highest limit not above the request */
++	for (i = ARRAY_SIZE(iusb_ma) - 1; i > 0 && iusb_ma[i] > ua / 1000; i--)
++		;
++	chg->iusb_idx = i;
++	return regmap_update_bits(chg->map, PBL_ACCESS2, IUSB_MASK, FIELD_PREP(IUSB_MASK, i));
++}
++
++static int chg_hw_init(struct pm8921_chg *chg, int ibat_ua, int iusb_ua)
++{
++	unsigned int safe;
++	int ret;
++
++	ret = chg_force_19p2mhz_clk(chg);
++	if (ret)
++		return ret;
++
++	/* never above what the firmware configured as the safe battery voltage */
++	ret = regmap_read(chg->map, CHG_VDD_SAFE, &safe);
++	if (ret)
++		return ret;
++	safe = V_MIN_MV + (safe & 0x7f) * V_STEP_MV;
++	if (chg->vdd_max_mv > safe) {
++		dev_warn(chg->dev, "limiting charge voltage to VDD_SAFE %u mV\n", safe);
++		chg->vdd_max_mv = safe;
++	}
++
++	ret = regmap_update_bits(chg->map, PBL_ACCESS2, ENUM_TIMER_STOP, ENUM_TIMER_STOP);
++	ret = ret ?: chg_set_iusb(chg, iusb_ua);
++	/* restart charging when the battery falls 100 mV below the charge voltage */
++	ret = ret ?: regmap_write(chg->map, CHG_VBAT_DET,
++				  (chg->vdd_max_mv - 100 - V_MIN_MV) / V_STEP_MV);
++	ret = ret ?: chg_set_ibat(chg, ibat_ua);
++	chg->ibat_cfg_ma = chg->ibat_ma;
++	ret = ret ?: chg_set_vdd_max(chg, chg->vdd_max_mv);
++	ret = ret ?: regmap_update_bits(chg->map, CHG_CNTRL_3, CHG_EN, CHG_EN);
++	return ret;
++}
++
++static void chg_clear_failed(struct pm8921_chg *chg)
++{
++	regmap_update_bits(chg->map, CHG_CNTRL_3, ATC_FAILED_CLEAR | CHG_FAILED_CLEAR,
++			   ATC_FAILED_CLEAR | CHG_FAILED_CLEAR);
++	regmap_update_bits(chg->map, CHG_CNTRL_3, ATC_FAILED_CLEAR | CHG_FAILED_CLEAR, 0);
++}
++
++static bool chg_usb_present(struct pm8921_chg *chg)
++{
++	bool state = false;
++
++	if (irq_get_irqchip_state(chg->usbin_irq, IRQCHIP_STATE_LINE_LEVEL, &state))
++		return false;
++	return state;
++}
++
++static void chg_thermal(struct pm8921_chg *chg)
++{
++	int t, state = chg->therm_state;
++
++	if (iio_read_channel_processed(chg->therm, &t))
++		return;
++	if (t >= HOT_MC)
++		state = THERM_HOT;
++	else if (t >= HOT_CLEAR_MC)
++		state = max(state, THERM_WARM);
++	else if (t >= WARM_CLEAR_MC)
++		state = min(state, THERM_WARM);
++	else
++		state = THERM_OK;
++	if (state == chg->therm_state)
++		return;
++
++	dev_info(chg->dev, "battery %d.%d C: %s\n", t / 1000, t % 1000 / 100,
++		 state == THERM_HOT ? "charging paused" :
++		 state == THERM_WARM ? "charge current reduced" : "normal charging");
++	chg->therm_state = state;
++	chg_set_ibat(chg, (state == THERM_OK ? chg->ibat_cfg_ma : WARM_IBAT_MA) * 1000);
++	regmap_update_bits(chg->map, CHG_CNTRL_3, CHG_EN, state == THERM_HOT ? 0 : CHG_EN);
++}
++
++static void chg_work(struct work_struct *work)
++{
++	struct pm8921_chg *chg = container_of(work, struct pm8921_chg, work.work);
++	bool usb = chg_usb_present(chg);
++	int fsm = chg_fsm_state(chg);
++
++	chg_thermal(chg);
++
++	/* the safety timer (CHG_TCHG_MAX) ends in CHG_FAIL; a plugged-in server must charge again */
++	if (usb && (fsm == FSM_CHG_FAIL || fsm == FSM_ATC_FAIL)) {
++		dev_info(chg->dev, "charger in failed state %d, restarting\n", fsm);
++		chg_clear_failed(chg);
++	}
++
++	if (fsm != chg->fsm || usb != chg->usb_online) {
++		chg->fsm = fsm;
++		chg->usb_online = usb;
++		power_supply_changed(chg->bat);
++		power_supply_changed(chg->usb);
++	}
++	schedule_delayed_work(&chg->work, msecs_to_jiffies(POLL_MS));
++}
++
++static irqreturn_t chg_usbin_irq(int irq, void *data)
++{
++	struct pm8921_chg *chg = data;
++
++	mod_delayed_work(system_wq, &chg->work, msecs_to_jiffies(100));
++	return IRQ_HANDLED;
++}
++
++static int chg_status(struct pm8921_chg *chg)
++{
++	int fsm = chg_fsm_state(chg);
++
++	if (fsm < 0 || !chg_usb_present(chg))
++		return POWER_SUPPLY_STATUS_DISCHARGING;
++	switch (fsm) {
++	case FSM_ATC_2A: case FSM_ATC_2B: case FSM_ON_CHG_AND_BAT: case FSM_FAST_CHG: case FSM_TRKL_CHG:
++		return POWER_SUPPLY_STATUS_CHARGING;
++	case FSM_ON_CHG_HIGHI: case FSM_EOC:
++		return POWER_SUPPLY_STATUS_FULL;
++	case FSM_ON_BAT: case FSM_ATC_FAIL: case FSM_CHG_FAIL:
++		return POWER_SUPPLY_STATUS_DISCHARGING;
++	default:
++		return POWER_SUPPLY_STATUS_NOT_CHARGING;
++	}
++}
++
++static int chg_capacity(int uv)
++{
++	int mv = uv / 1000, i;
++
++	if (mv <= ocv[0].mv)
++		return 0;
++	for (i = 1; i < ARRAY_SIZE(ocv); i++)
++		if (mv < ocv[i].mv)
++			return ocv[i - 1].pct + (mv - ocv[i - 1].mv) *
++				(ocv[i].pct - ocv[i - 1].pct) / (ocv[i].mv - ocv[i - 1].mv);
++	return 100;
++}
++
++static const enum power_supply_property bat_props[] = {
++	POWER_SUPPLY_PROP_STATUS,
++	POWER_SUPPLY_PROP_PRESENT,
++	POWER_SUPPLY_PROP_TECHNOLOGY,
++	POWER_SUPPLY_PROP_VOLTAGE_NOW,
++	POWER_SUPPLY_PROP_CAPACITY,
++	POWER_SUPPLY_PROP_TEMP,
++	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
++	POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE_MAX,
++};
++
++static int bat_get_property(struct power_supply *psy, enum power_supply_property psp,
++			    union power_supply_propval *val)
++{
++	struct pm8921_chg *chg = power_supply_get_drvdata(psy);
++	int ret;
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_STATUS:
++		val->intval = chg_status(chg);
++		return 0;
++	case POWER_SUPPLY_PROP_PRESENT:
++		val->intval = 1;
++		return 0;
++	case POWER_SUPPLY_PROP_TECHNOLOGY:
++		val->intval = POWER_SUPPLY_TECHNOLOGY_LION;
++		return 0;
++	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
++	case POWER_SUPPLY_PROP_CAPACITY:
++		/* the XOADC reports processed voltages in microvolts */
++		ret = iio_read_channel_processed(chg->vbat, &val->intval);
++		if (ret)
++			return ret;
++		if (psp == POWER_SUPPLY_PROP_CAPACITY)
++			val->intval = chg_capacity(val->intval);
++		return 0;
++	case POWER_SUPPLY_PROP_TEMP:
++		/* IIO: millidegrees, power supply: tenths of a degree */
++		ret = iio_read_channel_processed(chg->therm, &val->intval);
++		val->intval /= 100;
++		return ret;
++	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX:
++		val->intval = chg->ibat_ma * 1000;
++		return 0;
++	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE_MAX:
++		val->intval = chg->vdd_max_mv * 1000;
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++static const enum power_supply_property usb_props[] = {
++	POWER_SUPPLY_PROP_ONLINE,
++	POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
++};
++
++static int usb_get_property(struct power_supply *psy, enum power_supply_property psp,
++			    union power_supply_propval *val)
++{
++	struct pm8921_chg *chg = power_supply_get_drvdata(psy);
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_ONLINE:
++		val->intval = chg_usb_present(chg);
++		return 0;
++	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
++		val->intval = iusb_ma[chg->iusb_idx] * 1000;
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++/* both limits can be changed at runtime, e.g. lowered for a weak USB port */
++static int bat_set_property(struct power_supply *psy, enum power_supply_property psp,
++			    const union power_supply_propval *val)
++{
++	struct pm8921_chg *chg = power_supply_get_drvdata(psy);
++
++	if (psp != POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX)
++		return -EINVAL;
++	chg->ibat_cfg_ma = clamp(val->intval / 1000, 325, 3025);
++	/* while warm the reduced current stays; the new value applies once it has cooled down */
++	return chg->therm_state == THERM_OK ? chg_set_ibat(chg, val->intval) : 0;
++}
++
++static int usb_set_property(struct power_supply *psy, enum power_supply_property psp,
++			    const union power_supply_propval *val)
++{
++	if (psp != POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT)
++		return -EINVAL;
++	return chg_set_iusb(power_supply_get_drvdata(psy), val->intval);
++}
++
++static int bat_writeable(struct power_supply *psy, enum power_supply_property psp)
++{
++	return psp == POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX;
++}
++
++static int usb_writeable(struct power_supply *psy, enum power_supply_property psp)
++{
++	return psp == POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT;
++}
++
++static const struct power_supply_desc bat_desc = {
++	.name = "battery",
++	.type = POWER_SUPPLY_TYPE_BATTERY,
++	.properties = bat_props,
++	.num_properties = ARRAY_SIZE(bat_props),
++	.get_property = bat_get_property,
++	.set_property = bat_set_property,
++	.property_is_writeable = bat_writeable,
++};
++
++static const struct power_supply_desc usb_desc = {
++	.name = "usb",
++	.type = POWER_SUPPLY_TYPE_USB,
++	.properties = usb_props,
++	.num_properties = ARRAY_SIZE(usb_props),
++	.get_property = usb_get_property,
++	.set_property = usb_set_property,
++	.property_is_writeable = usb_writeable,
++};
++
++static int pm8921_chg_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct power_supply_config cfg = {};
++	struct pm8921_chg *chg;
++	u32 uv = 4100000, ua = 1500000, iusb = 1500000;
++	int ret;
++
++	chg = devm_kzalloc(dev, sizeof(*chg), GFP_KERNEL);
++	if (!chg)
++		return -ENOMEM;
++	chg->dev = dev;
++	chg->fsm = -1;
++	mutex_init(&chg->lock);
++	platform_set_drvdata(pdev, chg);
++
++	chg->map = dev_get_regmap(dev->parent, NULL);
++	if (!chg->map)
++		return -ENODEV;
++
++	of_property_read_u32(dev->of_node, "lumia,vdd-max-microvolt", &uv);
++	of_property_read_u32(dev->of_node, "lumia,ibat-max-microamp", &ua);
++	of_property_read_u32(dev->of_node, "lumia,iusb-max-microamp", &iusb);
++	chg->vdd_max_mv = clamp(uv / 1000, 3400U, 4500U);
++
++	chg->vbat = devm_iio_channel_get(dev, "vbat");
++	if (IS_ERR(chg->vbat))
++		return dev_err_probe(dev, PTR_ERR(chg->vbat), "no vbat ADC channel\n");
++	chg->therm = devm_iio_channel_get(dev, "batt_therm");
++	if (IS_ERR(chg->therm))
++		return dev_err_probe(dev, PTR_ERR(chg->therm), "no batt_therm ADC channel\n");
++
++	chg->usbin_irq = platform_get_irq_byname(pdev, "usbin-valid");
++	if (chg->usbin_irq < 0)
++		return chg->usbin_irq;
++
++	ret = chg_hw_init(chg, ua, iusb);
++	if (ret)
++		return dev_err_probe(dev, ret, "charger setup failed\n");
++
++	cfg.drv_data = chg;
++	cfg.fwnode = dev_fwnode(dev);
++	chg->bat = devm_power_supply_register(dev, &bat_desc, &cfg);
++	if (IS_ERR(chg->bat))
++		return PTR_ERR(chg->bat);
++	chg->usb = devm_power_supply_register(dev, &usb_desc, &cfg);
++	if (IS_ERR(chg->usb))
++		return PTR_ERR(chg->usb);
++
++	ret = devm_delayed_work_autocancel(dev, &chg->work, chg_work);
++	if (ret)
++		return ret;
++	ret = devm_request_threaded_irq(dev, chg->usbin_irq, NULL, chg_usbin_irq, IRQF_ONESHOT,
++					"pm8921-usbin-valid", chg);
++	if (ret)
++		return ret;
++	schedule_delayed_work(&chg->work, 0);
++
++	dev_info(dev, "charging to %u mV, %u mA, USB input %d mA\n", chg->vdd_max_mv,
++		 chg->ibat_ma, iusb_ma[chg->iusb_idx]);
++	return 0;
++}
++
++static const struct of_device_id pm8921_chg_of_match[] = {
++	{ .compatible = "lumia,pm8921-charger" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, pm8921_chg_of_match);
++
++static struct platform_driver pm8921_chg_driver = {
++	.probe = pm8921_chg_probe,
++	.driver = {
++		.name = "pm8921-charger-lite",
++		.of_match_table = pm8921_chg_of_match,
++	},
++};
++module_platform_driver(pm8921_chg_driver);
++
++MODULE_DESCRIPTION("Minimal Qualcomm PM8921 charger driver");
++MODULE_LICENSE("GPL");

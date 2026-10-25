@@ -1,0 +1,19 @@
+--- a/drivers/iio/adc/qcom-pm8xxx-xoadc.c
++++ b/drivers/iio/adc/qcom-pm8xxx-xoadc.c
+@@ -776,6 +776,8 @@
+ 	ch->label = hwchan->datasheet_name;
+ 	fwnode_property_read_string(fwnode, "label", &ch->label);
+ 	ch->hwchan = hwchan;
++	/* input reference (RSV) from the channel table, e.g. PMIC_IN for AMUX_RSV1 */
++	ch->amux_ip_rsv = hwchan->amux_ip_rsv;
+ 	/* Everyone seems to use absolute calibration except in special cases */
+ 	ch->calibration = VADC_CALIB_ABSOLUTE;
+ 	/* Everyone seems to use default ("type 2") decimation */
+@@ -791,6 +793,7 @@
+ 			dev_err(dev, "%s invalid RSV value %d\n", name, rsv);
+ 			return -EINVAL;
+ 		}
++		ch->amux_ip_rsv = rsv;
+ 	}
+ 
+ 	/* Optional decimation, if omitted we use the default */

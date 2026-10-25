@@ -1,0 +1,77 @@
+--- a/arch/arm/mach-qcom/platsmp.c
++++ b/arch/arm/mach-qcom/platsmp.c
+@@ -16,6 +16,8 @@
+ #include <linux/io.h>
+ #include <linux/firmware/qcom/qcom_scm.h>
+ 
++#include <linux/sizes.h>
++
+ #include <asm/smp_plat.h>
+ 
+ 
+@@ -404,3 +406,65 @@
+ #endif
+ };
+ CPU_METHOD_OF_DECLARE(qcom_smp_kpssv2, "qcom,kpss-acc-v2", &qcom_smp_kpssv2_ops);
++
++/*
++ * Windows Phone 8 UEFI (Lumia 822) starts the secondary cores itself and parks them in the ACPI
++ * "multiprocessor parking protocol" mailbox from the MADT: a loop that waits (WFI) until the
++ * mailbox's ProcessorId (offset 0) matches its MPIDR and a jump address (offset 8) is set, then
++ * clears the address and branches there with the MMU off. Resetting such a core through its
++ * ACC (qcom,kpss-acc-v1) does not work: the secure firmware then never enters the Linux cold-boot
++ * address. The mailbox address comes from the cpu node's "lumia,parked-address".
++ */
++#define PARK_CPU_ID		0x0
++#define PARK_ENTRY		0x8
++
++static int lumia_park_boot_secondary(unsigned int cpu, struct task_struct *idle)
++{
++	struct device_node *np;
++	void __iomem *mbox;
++	u32 addr;
++	int ret;
++
++	np = of_get_cpu_node(cpu, NULL);
++	if (!np)
++		return -ENODEV;
++	ret = of_property_read_u32(np, "lumia,parked-address", &addr);
++	of_node_put(np);
++	if (ret)
++		return ret;
++
++	mbox = ioremap(addr, SZ_4K);
++	if (!mbox)
++		return -ENOMEM;
++
++	/* entry point first: the parked core checks the ID, then the address */
++	writel_relaxed(__pa_symbol(secondary_startup_arm), mbox + PARK_ENTRY);
++	writel_relaxed(0, mbox + PARK_ENTRY + 4);
++	wmb();
++	writel_relaxed(cpu_logical_map(cpu), mbox + PARK_CPU_ID);
++	wmb();
++	arch_send_wakeup_ipi_mask(cpumask_of(cpu));
++
++	iounmap(mbox);
++	return 0;
++}
++
++#ifdef CONFIG_HOTPLUG_CPU
++/*
++ * An offlined core would sit in qcom_cpu_die(), not in the mailbox loop, and could not come back.
++ * Refuse offlining (cpu_can_disable = false would also hide the sysfs "online" file).
++ */
++static int lumia_park_cpu_disable(unsigned int cpu)
++{
++	return -EPERM;
++}
++#endif
++
++static const struct smp_operations lumia_park_smp_ops __initconst = {
++	.smp_boot_secondary	= lumia_park_boot_secondary,
++#ifdef CONFIG_HOTPLUG_CPU
++	.cpu_die		= qcom_cpu_die,
++	.cpu_disable		= lumia_park_cpu_disable,
++#endif
++};
++CPU_METHOD_OF_DECLARE(lumia_park, "lumia,parking-protocol", &lumia_park_smp_ops);

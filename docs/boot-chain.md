@@ -55,10 +55,11 @@ Build: [`loader/build.sh`](../loader/build.sh). Rules found by trial and error o
 
 ```
 console=tty0 earlycon=efifb keep_bootcon cma=0 clk_ignore_unused pd_ignore_unused regulator_ignore_unused
-nosmp efi=debug,noruntime,novamap loglevel=8 ignore_loglevel panic=3 rdinit=/init
+maxcpus=1 efi=debug,noruntime,novamap loglevel=8 ignore_loglevel panic=3 rdinit=/init
 ```
 
 - `clk/pd/regulator_ignore_unused`: the DT does not describe every consumer of what UEFI left on (display!).
-- `nosmp`: the second Krait core is not brought up (no SPM/SAW description yet).
+- `maxcpus=1`: CPU1 is not started during boot; `init` onlines it 20 s after SSH is up (kernel patch
+  0008, UEFI parking-protocol mailbox). `touch /etc/lumia-nosmp` on the root image keeps it offline.
 - `efi=noruntime,novamap`: UEFI runtime services are not used.
 - `panic=3`: a panic restarts the phone (into Windows unless Volume Down is held).

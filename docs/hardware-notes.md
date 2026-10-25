@@ -46,10 +46,64 @@ USB needs RPM L3 (3.3 V) and L4 (1.8 V), both always-on in the DT.
 - `0x80400000` framebuffer
 - `0x88E00000-0x8FFFFFFF` not System RAM (subsystem carve-outs); Riva firmware at `0x8F000000-0x8F6FFFFF`
 
+## Second CPU core
+
+Windows Phone 8 UEFI starts both Krait cores and parks CPU1 using the ACPI *multiprocessor parking
+protocol*. The MADT (ACPI tables at `0xbeac1000`, MADT at `0xbea43000`) has GICC entries with parking
+version 1 and mailboxes **CPU0 `0x80301000`, CPU1 `0x80302000`**. The firmware loop lives in the mailbox page
+itself (offset `0x800`): `if ((mbox[0] & 0xff) == MPIDR.Aff0 && mbox[8]) { r0 = mbox; mbox[8] = 0; bx mbox[8]; }
+else wfi`. Kernel patch 0008 writes `secondary_startup_arm` to `+8`, the CPU ID to `+0` and sends an SGI.
+
+What does not work: the mainline Krait bring-up through the ACC/SAW registers (`qcom,kpss-acc-v1`). It
+resets the core (ACC `CPU_PWR_CTL` goes to `0x180`), but the secure firmware then does not jump to the
+Linux cold-boot address, and CPU1 is lost until the next reboot.
+
+No cpufreq/cpuidle yet: both cores run at the clock UEFI left (BogoMIPS 13.5 is the timer, not the CPU).
+
+## Battery and charger
+
+PM8921 on SSBI (`0x500000`, PMIC interrupt = TLMM GPIO 104), HWREV `0xF4`/`0x06`. The charger is a hardware
+state machine (trickle, fast charge, end of charge, recharge, battery temperature limits). **Windows UEFI
+leaves it disabled**: `CHG_CNTRL_3` bit 7 = 0, `VDD_MAX` 3.60 V, USB input limit (`PBL_ACCESS2[4:2]`)
+100 mA. Without a driver the phone sat in FSM state 3 (`ON_BAT`) and drained its battery on USB.
+
+The `lumia,pm8921-charger` driver (patch 0011) sets, from the DT: charge voltage **4.10 V** (the cell
+allows 4.2 V = UEFI's `VDD_SAFE`; less wear while always plugged in), battery current 1.5 A, USB input
+1.5 A (about 7 W, what Windows Phone charges with), recharge below 4.00 V, then enables the state machine.
+It restarts the charger when the safety timer (`CHG_TCHG_MAX`, 240 min from UEFI) has put it into
+`CHG_FAIL`. Status: `/sys/class/power_supply/battery/{status,capacity,voltage_now,temp}` and
+`.../usb/online`. `capacity` is estimated from the voltage (no fuel gauge; the PM8921 BMS is unused), so
+it reads high while charging.
+
+The limits can be changed at runtime (microamps; lost at reboot, the DT values apply again):
+`echo 500000 > /sys/class/power_supply/usb/input_current_limit` (e.g. for a PC port that cuts out above
+500 mA; the PMIC's own VIN_MIN loop at 4.3 V already backs off when VBUS sags) and
+`.../battery/constant_charge_current_max`. Measured on a PC port: 500 mA input did not cover the system
+under load (battery still discharging); 1.5 A raised the battery voltage by 150 mV with VBUS at 4.55 V.
+
+Temperature: besides the PMIC's own hot/cold cutoff, the driver reduces the battery current to 325 mA at
+45 °C (full current again below 42 °C) and pauses charging at 50 °C (resumes below 45 °C), like
+downstream's warm/hot handling. Measured: about 43 °C battery / 53 °C die while charging at
+7 W right after a 10-minute two-core load test.
+
+| Register | | Register | |
+|---|---|---|---|
+| `0x005` PBL_ACCESS2 | [4:2] USB input limit index (100/500/700/850/900/1100/1300/1500 mA), bit 1 enum timer stop | `0x216` CHG_CNTRL_3 | bit 7 auto charge enable, bits 1:0 clear ATC/charge failed |
+| `0x205` CHG_IBAT_MAX | 225 mA + 50 mA x [5:0] | `0x220` CHG_VDD_MAX | 3240 mV + 20 mV x [6:0] (+10 mV bit 7) |
+| `0x206` CHG_TEST | bank access: write `0x80 \| bank<<4 \| data`, read: write `bank<<4`, read back | `0x221` CHG_VDD_SAFE | upper limit for VDD_MAX |
+| `0x213` CHG_VBAT_DET | recharge threshold, same encoding as VDD_MAX | `0x1c0`/`0x1c3` | IRQ block select / real-time status (block 1 bit 7 USBIN_VALID, block 2 bit 1 FASTCHG) |
+
+FSM state: write `0xc2` to CHG_TEST, then bank 7 [3:0] and bank 4 [0] (state 3 on battery, 7 fast charge,
+8 trickle, 9 charge failed, 10 end of charge).
+
+**Housekeeping ADC (XOADC)** at `0x197`: two mainline bugs fixed (patches 0009/0010, see
+[kernel.md](kernel.md)). Channels in `/sys/bus/iio/devices/iio:device0` (`vbat`, `vph_pwr`, `usb_vbus`,
+`batt_therm`, `die_temp`, ...); voltages in microvolts.
+
 ## Misc
 
 - `PS_HOLD` at `0x00800820` (`qcom,pshold` node) - writing it restarts the phone; `reboot` uses it.
-- The second CPU core is not started (`nosmp`).
+- PM8921 RTC (`rtc0`) is read-only for Linux (Windows owns it); it reads near 1970, `ntpd` sets the time.
 - `QCOM_TSENS` (thermal sensor child of GCC) oopses with this DT - disabled.
 - The Windows WLAN driver is `QCWLAN8960.sys`, config `QCWLAN8960cfg.dat`, firmware loaded by Windows'
   PIL from `System32\qcwcnss8960.mbn`.

@@ -26,6 +26,8 @@ Base: `/boot/config` of postmarketOS `linux-postmarketos-mainline-7.3-r0` (armv7
 | `QCOM_SYSMON` off | without QRTR it makes the WCNSS probe fail ("failed to initialize qmi handle") |
 | `EXTRA_FIRMWARE=""` | the Riva firmware is loaded from `/lib/firmware` at runtime (not redistributable) |
 | `LOCALVERSION="-lumia"` | |
+| `RTC_DRV_PM8XXX=y`, `QCOM_PM8XXX_XOADC=y` | PM8921 RTC and housekeeping ADC (battery voltage/temperature) without modules |
+| `CHARGER_PM8921_LITE=y` | the charger driver from patch 0011 |
 
 ## Patches
 
@@ -37,6 +39,11 @@ Base: `/boot/config` of postmarketOS `linux-postmarketos-mainline-7.3-r0` (armv7
 | `0004-remoteproc-qcom_wcnss-no-auto-boot` | Riva is started from userspace (`echo start > /sys/class/remoteproc/remoteproc0/state`), after USB/SSH are up, so a Riva problem can't stop the boot. |
 | `0005-soc-qcom-wcnss_ctrl-optional-handshake` | DT flag `lumia,no-ctrl-handshake`: the Windows Phone 8 Riva firmware has no `WCNSS_CTRL` channel; skip the version/NV handshake and create the wcn36xx device directly. |
 | `0006-wcn36xx-treat-API-0.x-firmware-as-old` | that firmware reports API 0.1.1.0; it needs the v0 `config_bss`/`config_sta` messages, no feature-caps exchange and the old beacon-miss format (like the 1.2.2.24 firmware). |
+| `0007-clk-qcom-rpm-vote-TCXO-D0-for-XOADC` | votes the PM8921 TCXO D0 buffer on (RPM `CXO_BUFFERS` = 2), as downstream `msm_xo` does for the PMIC ADC and the charger's 19.2 MHz clock. |
+| `0008-ARM-qcom-boot-secondary-CPUs-via-parking-protocol` | **second CPU core**: enable-method `lumia,parking-protocol`. The UEFI parks CPU1 in the ACPI parking-protocol mailbox from the MADT (`lumia,parked-address`); the kernel writes the entry point and the CPU ID there and sends an SGI. The mainline Krait ACC/SAW reset (`qcom,kpss-acc-v1`) resets the core, but the secure firmware then never enters the Linux boot address. An online CPU1 cannot be offlined again (`-EPERM`), it would not return to the mailbox. |
+| `0009-iio-adc-qcom-pm8xxx-xoadc-use-channel-RSV` | **mainline bug**: the per-channel input reference (`amux_ip_rsv`, `PMIC_IN` for nearly all channels) was never copied from the channel table, so every conversion measured the XO input and all channels read the same. |
+| `0010-iio-adc-qcom-pm8xxx-xoadc-PM8921-codes-are-signed` | the PM8921 XOADC result is two's complement (GND about -16000, 0.625 V about -3000, 1.25 V about +9900); read as unsigned, everything between the references and above them came out wrong (e.g. `vph_pwr` 3.74 V instead of 4.09 V). Flipped to offset binary for the unsigned calibration math. |
+| `0011-power-supply-minimal-PM8921-charger` | `lumia,pm8921-charger`: programs charge voltage, battery current and USB input current from DT, enables the hardware charger state machine, restarts it after the safety timer expires, limits current at 45 °C and pauses at 50 °C battery temperature, reports `/sys/class/power_supply/{battery,usb}`. See [hardware-notes.md](hardware-notes.md#battery-and-charger). |
 
-These are workarounds for this phone, not upstream-ready patches; 0003 and 0006 are the most likely
-upstream candidates.
+These are workarounds for this phone, not upstream-ready patches; 0003, 0006, 0009 and 0010 are the most
+likely upstream candidates.

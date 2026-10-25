@@ -1,5 +1,6 @@
 #!/bin/bash
-# Builds the base Lumia 822 DTB (CPU, GIC, timer, clocks, RPM L3/L4, USB gadget, eMMC, PS_HOLD restart)
+# Builds the base Lumia 822 DTB (CPUs, GIC, timer, clocks, RPM L3/L4, USB gadget, eMMC, PS_HOLD restart,
+# PM8921 RTC + housekeeping ADC)
 # from the Samsung Galaxy Express (expressatt, also MSM8960) DTB shipped in the postmarketOS kernel
 # package. build_wifi_dtb.sh then adds Wi-Fi on top.
 #   build_base_dtb.sh [expressatt.dtb] [out.dtb]
@@ -18,12 +19,33 @@ if [ -z "$SRC" ]; then
 fi
 start_from "$SRC"
 
-# keep only CPU0, GIC, timer, GCC, LCC, RPM and USB
-step keep /clocks /cpus/cpu@0 /cpus/l2-cache /memory@80000000 /chosen /soc/interrupt-controller@2000000 /soc/timer@200a000 /soc/clock-controller@900000 /soc/clock-controller@2011000 /soc/rpm@108000 /soc/usb@12500000
+# keep only the CPUs, GIC, timer, GCC, LCC, RPM, USB and the PM8921 (on SSBI; its interrupt is TLMM
+# GPIO 104, the pinctrl node comes from build_wifi_dtb.sh)
+step keep /clocks /cpus /memory@80000000 /chosen /soc/interrupt-controller@2000000 /soc/timer@200a000 /soc/clock-controller@900000 /soc/clock-controller@2011000 /soc/rpm@108000 /soc/usb@12500000 /soc/ssbi@500000 /iio-hwmon
 step set /soc/timer@200a000 compatible "qcom,kpss-timer"
-step set /cpus/cpu@0 enable-method del          # single CPU (cmdline also has nosmp)
-step set /cpus/cpu@0 qcom,acc del
-step set /cpus/cpu@0 qcom,saw del
+# CPU1: UEFI leaves it parked in the ACPI parking-protocol mailbox listed in the MADT (CPU0 0x80301000,
+# CPU1 0x80302000); patch 0008 starts it from there. The ACC/SAW reset (qcom,kpss-acc-v1) does not work.
+for c in 0 1; do
+    step set /cpus/cpu@$c enable-method lumia,parking-protocol
+    step set /cpus/cpu@$c lumia,parked-address u32:$((0x80301000 + c * 0x1000))
+    step set /cpus/cpu@$c qcom,acc del; step set /cpus/cpu@$c qcom,saw del
+done
+# PM8921: keep the core (interrupt controller), RTC and XOADC (battery voltage/temperature, iio-hwmon).
+# No pwrkey (its probe rewrites PON_CNTL_1, a persistent PMIC register Windows also uses), keypad,
+# vibrator, GPIO/MPP blocks. The RTC stays read-only: Windows owns it.
+P=/soc/ssbi@500000/pmic
+step keepchildren $P rtc@11d,xoadc@197
+step set $P/rtc@11d allow-set-time del
+# Charger (patch 0011): UEFI leaves it off with a 100 mA USB input limit, so the phone ran from its
+# battery on USB. 4.1 V instead of the cell's 4.2 V (VDD_SAFE) is kinder to a battery that is plugged
+# in 24/7. PM8921 irq 15 = USBIN_VALID; ADC 0x3b = xoadc (channel 1 vbat, 8 batt_therm).
+step addnode $P charger@200; C=$P/charger@200
+step set $C compatible lumia,pm8921-charger; step set $C reg u32:0x200
+step set $C interrupts-extended u32:0x0e,15,3; step set $C interrupt-names usbin-valid
+step set $C io-channels u32:0x3b,0,1,0x3b,0,8; step set $C io-channel-names "strs:vbat|batt_therm"
+step set $C lumia,vdd-max-microvolt u32:4100000
+step set $C lumia,ibat-max-microamp u32:1500000
+step set $C lumia,iusb-max-microamp u32:1500000
 step set /chosen stdout-path del
 step set / model "Nokia Lumia 822"
 step set / compatible "strs:nokia,rm-845|qcom,msm8960"

@@ -1,1 +1,1 @@
-console=tty0 earlycon=efifb keep_bootcon cma=0 clk_ignore_unused pd_ignore_unused regulator_ignore_unused nosmp efi=debug,noruntime,novamap loglevel=8 ignore_loglevel panic=3 rdinit=/init
+console=tty0 earlycon=efifb keep_bootcon cma=0 clk_ignore_unused pd_ignore_unused regulator_ignore_unused maxcpus=1 efi=debug,noruntime,novamap loglevel=8 ignore_loglevel panic=3 rdinit=/init

@@ -113,6 +113,10 @@ ntpd -p pool.ntp.org
 # mDNS: the phone answers as lumia822.local on USB and Wi-Fi
 command -v avahi-daemon >/dev/null && avahi-daemon -D
 [ -x /etc/local.d/start.sh ] && /etc/local.d/start.sh &   # Wi-Fi bring-up (and later services)
+# Second core: the kernel boots with maxcpus=1 and CPU1 is started from the UEFI parking-protocol
+# mailbox (patch 0008) only once SSH is up, so a problem there costs a reboot, not a Windows round trip.
+C1=/sys/devices/system/cpu/cpu1/online
+[ -w $C1 ] && [ ! -e /etc/lumia-nosmp ] && (sleep 20; echo 1 > $C1) &
 
 STATE="waiting for USB controller"
 RETRIES=0
@@ -147,5 +151,7 @@ while true; do
     echo "USB: $STATE"
     echo "Wi-Fi: $(ip -4 -o addr show wlan0 2>/dev/null | awk '{print $4}' | grep . || echo 'not connected')    name: lumia822.local"
     echo "dhcp leases: $(cat /run/dnsmasq.leases 2>/dev/null | wc -l)  sshd: $(pidof dropbear >/dev/null && echo running || echo stopped)"
+    B=/sys/class/power_supply/battery
+    [ -d $B ] && echo "CPUs: $(cat /sys/devices/system/cpu/online)  battery: $(cat $B/capacity)% $(( $(cat $B/voltage_now) / 1000 )) mV $(cat $B/status)"
     sleep 10
 done

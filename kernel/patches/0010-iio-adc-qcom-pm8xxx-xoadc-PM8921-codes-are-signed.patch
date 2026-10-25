@@ -1,0 +1,37 @@
+--- a/drivers/iio/adc/qcom-pm8xxx-xoadc.c
++++ b/drivers/iio/adc/qcom-pm8xxx-xoadc.c
+@@ -189,6 +189,8 @@
+  * @prescaling: this variant uses AMUX bits 2 & 3 for prescaling (PM8058)
+  * @second_level_mux: this variant uses AMUX bits 2 & 3 for a second level
+  * mux
++ * @signed_code: the conversion result is two's complement (PM8921: GND reads
++ * about -16000, 0.625 V about -3000, 1.25 V about +9900)
+  */
+ struct xoadc_variant {
+ 	const char name[16];
+@@ -196,6 +198,7 @@
+ 	bool broken_ratiometric;
+ 	bool prescaling;
+ 	bool second_level_mux;
++	bool signed_code;
+ };
+ 
+ /*
+@@ -548,6 +551,9 @@
+ 		goto unlock;
+ 	msb = val;
+ 	*adc_code = (msb << 8) | lsb;
++	/* offset binary keeps the code monotonic for the unsigned calibration math */
++	if (adc->variant->signed_code)
++		*adc_code ^= 0x8000;
+ 
+ 	/* Turn off the ADC by setting the arbiter to 0 twice */
+ 	ret = regmap_write(adc->map, ADC_ARB_USRP_CNTRL, 0);
+@@ -992,6 +998,7 @@
+ 	.name = "PM8921-XOADC",
+ 	.channels = pm8921_xoadc_channels,
+ 	.second_level_mux = true,
++	.signed_code = true,
+ };
+ 
+ static const struct of_device_id pm8xxx_xoadc_id_table[] = {

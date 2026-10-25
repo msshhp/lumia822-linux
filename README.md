@@ -41,10 +41,13 @@ round-trip min/avg/max = 34.358/39.501/44.644 ms
 | Wi-Fi (WCN3660 / Riva) | WPA2, DHCP, auto-reconnect; firmware taken from the phone's own Windows |
 | mDNS | the phone answers as `lumia822.local` |
 | Internet over USB | through Windows Internet Connection Sharing / NAT on the PC |
+| Both CPU cores | CPU1 started from the UEFI parking-protocol mailbox (onlined by `init` after boot) |
+| Battery charging | PM8921 charger to 4.1 V at about 7 W; battery voltage, temperature, estimated capacity in `/sys/class/power_supply/battery` |
+| PMIC ADC and RTC | battery/USB/system voltages and temperatures (`iio:device0`, `hwmon`); RTC read-only |
 
 | Not done (yet) | |
 |---|---|
-| Battery / charging driver, display backlight control, touch, buttons, audio, modem, camera, GPU, Bluetooth, SD card, second CPU core (`nosmp`) | contributions welcome |
+| Fuel gauge (BMS), cpufreq/cpuidle, display backlight control, touch, buttons, audio, modem, camera, GPU, Bluetooth, SD card | contributions welcome |
 
 > [!WARNING]
 > **The bootloader unlock can permanently brick your phone.** There is no public emergency loader for the
