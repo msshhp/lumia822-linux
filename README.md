@@ -6,6 +6,30 @@ the phone's own Windows boot manager. Windows 10 Mobile stays the default OS; Li
 
 The goal of this project is a small, always-on **home server** you can reach over SSH.
 
+<p align="center">
+  <img src="docs/images/status-screen.jpg" width="420"
+       alt="Lumia 822 running Linux 7.3: status screen with persistent storage, USB up, Wi-Fi address, lumia822.local, sshd running">
+</p>
+
+The phone's status screen after booting Linux 7.3: persistent root on the eMMC, USB networking up, Wi-Fi
+connected, reachable as `lumia822.local`, SSH running. From the PC, over Wi-Fi:
+
+```console
+$ ssh root@lumia822.local
+lumia822:~# uname -sr; cat /etc/alpine-release
+Linux 7.3.0-lumia
+3.22.7
+lumia822:~# df -h /
+/dev/loop0                3.9G     23.5M      3.8G   1% /
+lumia822:~# ip -4 -o addr show wlan0 | awk '{print $2, $4}'
+wlan0 192.168.31.179/24
+lumia822:~# iw dev wlan0 link | grep -E 'signal|tx bitrate'
+	signal: -63 dBm
+	tx bitrate: 13.5 MBit/s MCS 0 40MHz
+lumia822:~# ping -c 2 -q 1.1.1.1 | tail -1
+round-trip min/avg/max = 34.358/39.501/44.644 ms
+```
+
 | Works | Notes |
 |---|---|
 | Boot from the Windows boot manager | Own boot application `LL11.efi` starts the Linux EFI-stub kernel |

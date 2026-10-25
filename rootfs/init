@@ -125,10 +125,11 @@ while true; do
     fi
     UDC=$(ls /sys/class/udc 2>/dev/null | head -n 1)
     if [ -n "$UDC" ] && [ -z "$(cat $G/UDC 2>/dev/null)" ]; then
-        echo "$UDC" > $G/UDC && STATE="up - ssh root@192.168.42.1" &&
+        echo "$UDC" > $G/UDC &&
         setsid sh -c 'while true; do sh -l </dev/ttyGS0 >/dev/ttyGS0 2>&1; sleep 1; done' &
     fi
-    [ -n "$(cat $G/UDC 2>/dev/null)" ] && net_up 2>/dev/null
+    # read the binding every pass: after switch_root the gadget is already bound by stage 1
+    [ -n "$(cat $G/UDC 2>/dev/null)" ] && STATE="up - ssh root@192.168.42.1" && net_up 2>/dev/null
     # kernel log readable from Windows (C:\Data\Linux\dmesg.txt) while USB is down or during boot
     if [ -n "$PERSIST" ] && { [ -z "$(cat $G/UDC 2>/dev/null)" ] || [ "$(cut -d. -f1 /proc/uptime)" -lt 120 ]; }; then
         dmesg > /mnt/data/Linux/dmesg.txt 2>/dev/null
