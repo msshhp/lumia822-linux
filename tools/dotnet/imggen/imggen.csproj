@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <NoWarn>CS8981;CS0162;CS0168;CS0219;CS0414;CS0649;CS0169</NoWarn>
+    <RootNamespace>WPinternals</RootNamespace>
+  </PropertyGroup>
+  <PropertyGroup>
+    <!-- WPinternals source: git clone https://github.com/ReneLergner/WPinternals (tested at commit
+         d270cace796bfe74d1719ba3201bddadb3c508dd) into <repo>/external/WPinternals, or build with
+         -p:WPinternalsDir=<path to the clone>\ -->
+    <WPinternalsDir Condition="'$(WPinternalsDir)' == ''">..\..\..\external\WPinternals\</WPinternalsDir>
+    <W>$(WPinternalsDir)WPinternals\</W>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="$(W)Models\FFU.cs" />
+    <Compile Include="$(W)Models\GPT.cs" />
+    <Compile Include="$(W)Models\SBL1.cs" />
+    <Compile Include="$(W)Models\SBL2.cs" />
+    <Compile Include="$(W)Models\SBL3.cs" />
+    <Compile Include="$(W)Models\UEFI.cs" />
+    <Compile Include="$(W)Models\QualcommPartition.cs" />
+    <Compile Include="$(W)Models\ByteOperations.cs" />
+    <Compile Include="$(W)HelperClasses\Converter.cs" />
+    <Compile Include="$(W)HelperClasses\WPinternalsException.cs" />
+    <Compile Include="$(W)HelperClasses\PE.cs" />
+    <Compile Include="$(W)HelperClasses\CompressedStream.cs" />
+    <Compile Include="$(W)HelperClasses\DecompressedStream.cs" />
+    <Compile Include="$(W)Models\LZMA.cs" />
+    <Compile Include="$(W)HelperClasses\ReadSeekableStream.cs" />
+    <Compile Include="$(W)HelperClasses\ResourceType.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="$(WPinternalsDir)7zip\7zip.csproj" />
+    <PackageReference Include="DiscUtils.Fat" Version="0.16.13" />
+    <PackageReference Include="DiscUtils.Streams" Version="0.16.13" />
+  </ItemGroup>
+</Project>

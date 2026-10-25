@@ -1,0 +1,11 @@
+# Copy to C:\EFIESP\linux\wpa_supplicant.conf (Linux installs it on every boot).
+# Prefer a hashed key: on any Linux/WSL run   wpa_passphrase "YourSSID" "YourPassword"
+# and paste its network block here instead of the plain-text psk below.
+ctrl_interface=/var/run/wpa_supplicant
+update_config=1
+country=US
+
+network={
+	ssid="YourSSID"
+	psk="YourPassword"
+}

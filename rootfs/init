@@ -1,0 +1,150 @@
+#!/bin/sh
+# Lumia 822 Alpine init. Stage 1 runs from the initramfs and switches root into the persistent
+# ext4 image \Linux\rootfs.img on the Windows Data partition (C:\Data); stage 2 (PERSIST=1)
+# runs from that image. If the image can't be mounted, everything runs from RAM instead
+# (create the image with `lumia-setup`).
+
+mnt() { mountpoint -q "$3" || mount -t "$1" "$2" "$3"; }
+# eMMC partition by GPT label (EFIESP, MainOS, Data, ...)
+part() { for u in /sys/class/block/mmcblk0p*/uevent; do grep -q "^PARTNAME=$1$" "$u" &&
+         echo "/dev/$(sed -n 's/^DEVNAME=//p' "$u")" && return; done; }
+
+mkdir -p /proc /sys /dev /run /tmp
+mnt proc proc /proc
+mnt sysfs sysfs /sys
+mnt devtmpfs devtmpfs /dev
+dmesg -n 1
+
+if [ -z "$PERSIST" ]; then
+    # ---------------- stage 1: try to switch into the persistent root ----------------
+    for i in $(seq 1 20); do DATA=$(part Data); [ -n "$DATA" ] && [ -b "$DATA" ] && break; sleep 0.5; done
+    mkdir -p /mnt/data /newroot
+    # A hard reset leaves the volume flagged dirty and ntfs3 then refuses rw; Linux only rewrites
+    # data inside the preallocated image, so mount with force (Windows autochk runs on its next boot)
+    if [ -n "$DATA" ] &&
+       { mount -t ntfs3 -o rw,noatime "$DATA" /mnt/data 2>/dev/null ||
+         mount -t ntfs3 -o rw,noatime,force "$DATA" /mnt/data 2>/dev/null; } &&
+       [ -f /mnt/data/Linux/rootfs.img ] &&
+       mount -o loop,noatime /mnt/data/Linux/rootfs.img /newroot 2>/dev/null &&
+       [ -x /newroot/init ]; then
+        # this initramfs (pushable from Windows) carries the master init; install it into the image
+        cmp -s /init /newroot/init || cp /init /newroot/init
+        mkdir -p /newroot/mnt/data /newroot/proc /newroot/sys /newroot/dev
+        mount --move /mnt/data /newroot/mnt/data
+        mount --move /dev /newroot/dev
+        mount --move /sys /newroot/sys
+        mount --move /proc /newroot/proc
+        export PERSIST=1
+        exec switch_root /newroot /init
+    fi
+    # fall through: no persistent root, keep running from RAM
+    umount /newroot /mnt/data 2>/dev/null
+    PERSIST_STATE="NO (running from RAM)"
+else
+    PERSIST_STATE="yes (eMMC Data:\\Linux\\rootfs.img)"
+fi
+
+# ---------------- stage 2 (or RAM fallback): the server ----------------
+mkdir -p /dev/pts /dev/shm
+mnt devpts devpts /dev/pts
+mnt tmpfs tmpfs /run
+mnt tmpfs tmpfs /tmp
+mnt configfs configfs /sys/kernel/config
+hostname lumia822
+exec >/dev/tty0 2>&1 </dev/tty0
+
+# USB transceiver clock fix: the clk driver never sets the RCG root enable (bit 11) and M/N
+# counter enable (bit 8) of USB_HS1_XCVR_NS because UEFI left the 60 MHz rate configured
+NS=$(regdump 00900000 290C | sed 's/.*=\([0-9a-f]*\).*/\1/')
+regdump -w 0090290C $(printf '%x' $((0x$NS | 0xB00))) > /dev/null
+
+# USB gadget: RNDIS network (auto-installs on Windows) + ACM serial console
+G=/sys/kernel/config/usb_gadget/g1
+mkdir -p $G/strings/0x409 $G/configs/c.1/strings/0x409 $G/functions/rndis.usb0 $G/functions/acm.usb0
+echo 0x1d6b > $G/idVendor
+echo 0x0104 > $G/idProduct
+echo 0xEF > $G/bDeviceClass
+echo 0x02 > $G/bDeviceSubClass
+echo 0x01 > $G/bDeviceProtocol
+echo "Lumia822" > $G/strings/0x409/serialnumber
+echo "Linux" > $G/strings/0x409/manufacturer
+echo "Lumia 822 Linux" > $G/strings/0x409/product
+echo "RNDIS+ACM" > $G/configs/c.1/strings/0x409/configuration
+echo 02:4c:75:6d:69:01 > $G/functions/rndis.usb0/dev_addr 2>/dev/null
+echo 02:4c:75:6d:69:02 > $G/functions/rndis.usb0/host_addr 2>/dev/null
+echo 1 > $G/os_desc/use
+echo 0xcd > $G/os_desc/b_vendor_code
+echo MSFT100 > $G/os_desc/qw_sign
+echo RNDIS > $G/functions/rndis.usb0/os_desc/interface.rndis/compatible_id
+echo 5162001 > $G/functions/rndis.usb0/os_desc/interface.rndis/sub_compatible_id
+ln -s $G/functions/rndis.usb0 $G/configs/c.1/ 2>/dev/null
+ln -s $G/functions/acm.usb0 $G/configs/c.1/ 2>/dev/null
+ln -s $G/configs/c.1 $G/os_desc/ 2>/dev/null
+
+# usb0 can only be configured once the gadget is bound to the controller; net_up() runs then and
+# on every status loop, so the link also recovers after a cable replug.
+net_up() {
+    ip -4 addr show usb0 | grep -q 192.168.42.1 || ip addr add 192.168.42.1/24 dev usb0
+    ip link set usb0 up
+    # PC NAT "LumiaNat" as a fallback route; Wi-Fi (udhcpc, metric ~300) is preferred when up
+    ip route | grep -q '^default via 192.168.42.2' || ip route add default via 192.168.42.2 dev usb0 metric 400
+}
+# Files the user can drop next to the kernel from Windows (C:\EFIESP\linux\): an SSH public key
+# file and a Wi-Fi config. They are installed on every boot, so editing them there takes effect.
+mkdir -p /mnt/efiesp
+if mount -t vfat -o ro "$(part EFIESP)" /mnt/efiesp 2>/dev/null; then
+    E=/mnt/efiesp/linux
+    [ -f $E/authorized_keys ] && mkdir -p /root/.ssh && chmod 700 /root/.ssh &&
+        tr -d '\r' < $E/authorized_keys > /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys
+    [ -f $E/wpa_supplicant.conf ] && mkdir -p /etc/wpa_supplicant &&
+        tr -d '\r' < $E/wpa_supplicant.conf > /etc/wpa_supplicant/wpa_supplicant.conf &&
+        chmod 600 /etc/wpa_supplicant/wpa_supplicant.conf
+    umount /mnt/efiesp
+fi
+
+# dnsmasq/dropbear start right away (dnsmasq --bind-dynamic picks usb0 up when it appears)
+printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf
+dnsmasq --user=root --port=0 --interface=usb0 --bind-dynamic \
+    --dhcp-range=192.168.42.2,192.168.42.2,255.255.255.0,12h \
+    --dhcp-option=3 --dhcp-option=6 --dhcp-leasefile=/run/dnsmasq.leases
+mkdir -p /etc/dropbear
+dropbear -R -s -p 22
+ntpd -p pool.ntp.org
+# mDNS: the phone answers as lumia822.local on USB and Wi-Fi
+command -v avahi-daemon >/dev/null && avahi-daemon -D
+[ -x /etc/local.d/start.sh ] && /etc/local.d/start.sh &   # Wi-Fi bring-up (and later services)
+
+STATE="waiting for USB controller"
+RETRIES=0
+while true; do
+    # the USB glue driver probes before the clock fix and does not retry by itself
+    if [ -z "$(ls /sys/class/udc 2>/dev/null)" ] && [ $RETRIES -lt 5 ]; then
+        RETRIES=$((RETRIES + 1))
+        echo 12500000.usb > /sys/bus/platform/drivers/msm_hsusb/bind 2>/dev/null
+        sleep 2
+    fi
+    UDC=$(ls /sys/class/udc 2>/dev/null | head -n 1)
+    if [ -n "$UDC" ] && [ -z "$(cat $G/UDC 2>/dev/null)" ]; then
+        echo "$UDC" > $G/UDC && STATE="up - ssh root@192.168.42.1" &&
+        setsid sh -c 'while true; do sh -l </dev/ttyGS0 >/dev/ttyGS0 2>&1; sleep 1; done' &
+    fi
+    [ -n "$(cat $G/UDC 2>/dev/null)" ] && net_up 2>/dev/null
+    # kernel log readable from Windows (C:\Data\Linux\dmesg.txt) while USB is down or during boot
+    if [ -n "$PERSIST" ] && { [ -z "$(cat $G/UDC 2>/dev/null)" ] || [ "$(cut -d. -f1 /proc/uptime)" -lt 120 ]; }; then
+        dmesg > /mnt/data/Linux/dmesg.txt 2>/dev/null
+    fi
+    clear
+    echo "================================================"
+    echo "  Lumia 822 - Alpine Linux server"
+    echo "================================================"
+    uname -a
+    free -m | head -2
+    echo "uptime: $(cut -d' ' -f1 /proc/uptime) s    $(date)"
+    echo "persistent storage: $PERSIST_STATE"
+    df -h / | tail -1
+    echo
+    echo "USB: $STATE"
+    echo "Wi-Fi: $(ip -4 -o addr show wlan0 2>/dev/null | awk '{print $4}' | grep . || echo 'not connected')    name: lumia822.local"
+    echo "dhcp leases: $(cat /run/dnsmasq.leases 2>/dev/null | wc -l)  sshd: $(pidof dropbear >/dev/null && echo running || echo stopped)"
+    sleep 10
+done

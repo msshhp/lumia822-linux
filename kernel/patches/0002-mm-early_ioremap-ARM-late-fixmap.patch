@@ -1,0 +1,16 @@
+--- a/mm/early_ioremap.c
++++ b/mm/early_ioremap.c
+@@ -61,6 +61,13 @@
+  * __late_set_fixmap() and __late_clear_fixmap(), which early_ioremap() uses
+  * instead of __early_set_fixmap() after the reset.
+  */
++/* ARM late fixmap: ARM can keep using its fixmap after paging_init, which lets the
++ * EFI framebuffer earlycon keep printing after early_ioremap_reset(). */
++#if defined(CONFIG_ARM) && !defined(__late_set_fixmap)
++#define __late_set_fixmap(idx, phys, prot) __set_fixmap(idx, phys, prot)
++#define __late_clear_fixmap(idx) __set_fixmap(idx, 0, FIXMAP_PAGE_CLEAR)
++#endif
++
+ #ifndef __late_set_fixmap
+ static inline void __init __late_set_fixmap(enum fixed_addresses idx,
+ 					    phys_addr_t phys, pgprot_t prot)

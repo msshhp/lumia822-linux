@@ -1,0 +1,11 @@
+#!/bin/sh
+# Clean restart/power-off for the Lumia: flush the ext4 root image, then the NTFS Data volume
+# holding it, so the volume isn't left flagged dirty.   lumia-reboot [poweroff]
+killall wpa_supplicant udhcpc ntpd dnsmasq 2>/dev/null
+sync
+mount -o remount,ro / 2>/dev/null
+sync
+mount -o remount,ro /mnt/data 2>/dev/null
+sync
+sleep 1
+if [ "$1" = poweroff ]; then poweroff -f; else reboot -f; fi

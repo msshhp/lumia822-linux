@@ -1,0 +1,34 @@
+#!/bin/sh
+# One-time setup of the persistent root: creates C:\Data\Linux\rootfs.img (ext4 image file on the
+# Windows Data partition), copies the running RAM system into it and asks for a restart.
+#
+#   lumia-setup [size_in_MB]        (default 4096; needs that much free space in C:\Data)
+#
+# Run it from the RAM system (status screen says "persistent storage: NO").
+set -e
+SIZE=${1:-4096}
+part() { for u in /sys/class/block/mmcblk0p*/uevent; do grep -q "^PARTNAME=$1$" "$u" &&
+         echo "/dev/$(sed -n 's/^DEVNAME=//p' "$u")" && return; done; }
+if mount | grep -q '^/dev/loop[0-9]* on / '; then
+    echo "Already running from the persistent image."; exit 1
+fi
+DATA=$(part Data)
+mkdir -p /mnt/data /newroot
+mountpoint -q /mnt/data || mount -t ntfs3 -o rw,noatime "$DATA" /mnt/data 2>/dev/null ||
+    mount -t ntfs3 -o rw,noatime,force "$DATA" /mnt/data
+IMG=/mnt/data/Linux/rootfs.img
+if [ -e $IMG ]; then echo "$IMG already exists; delete it from Linux or Windows to recreate."; exit 1; fi
+FREE=$(df -m /mnt/data | awk 'NR==2{print $4}')
+[ "$FREE" -gt $((SIZE + 512)) ] || { echo "Only $FREE MB free in C:\\Data, need $SIZE + 512."; exit 1; }
+mkdir -p /mnt/data/Linux
+echo "Writing a $SIZE MB image (takes a few minutes)..."
+dd if=/dev/zero of=$IMG bs=1M count=$SIZE conv=fsync 2>&1 | tail -1
+# nodiscard: the eMMC has no working TRIM in Linux
+mkfs.ext4 -q -F -E nodiscard -L lumia-root -m 1 $IMG
+mount -o loop,noatime $IMG /newroot
+for d in bin etc home lib media opt root sbin srv usr var; do [ -e /$d ] && cp -a /$d /newroot/; done
+cp -a /init /newroot/init
+mkdir -p /newroot/proc /newroot/sys /newroot/dev /newroot/run /newroot/tmp /newroot/mnt/data
+chmod 1777 /newroot/tmp
+sync; umount /newroot; sync
+echo "Done. Restart with: lumia-reboot   (hold Volume Down while it boots to come back to Linux)"

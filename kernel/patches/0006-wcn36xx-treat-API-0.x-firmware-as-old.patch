@@ -1,0 +1,73 @@
+--- a/drivers/net/wireless/ath/wcn36xx/wcn36xx.h
++++ b/drivers/net/wireless/ath/wcn36xx/wcn36xx.h
+@@ -301,6 +301,12 @@
+ 	struct wcn36xx_chan_survey	chan_survey[];
+ };
+ 
++/* pre-1.2.2.24 firmware (API 0.x, e.g. Windows Phone 8 Riva) also uses the v0 HAL messages */
++static inline bool wcn36xx_is_old_fw_api0(struct wcn36xx *wcn)
++{
++	return wcn->fw_major == 0;
++}
++
+ static inline bool wcn36xx_is_fw_version(struct wcn36xx *wcn,
+ 					 u8 major,
+ 					 u8 minor,
+@@ -312,6 +318,12 @@
+ 		wcn->fw_version == version &&
+ 		wcn->fw_revision == revision);
+ }
++
++/* firmware that takes the v0 HAL messages and has no feature caps exchange */
++static inline bool wcn36xx_is_old_fw(struct wcn36xx *wcn)
++{
++	return wcn36xx_is_fw_version(wcn, 1, 2, 2, 24) || wcn36xx_is_old_fw_api0(wcn);
++}
+ void wcn36xx_set_default_rates(struct wcn36xx_hal_supported_rates *rates);
+ void wcn36xx_set_default_rates_v1(struct wcn36xx_hal_supported_rates_v1 *rates);
+ 
+@@ -340,3 +352,4 @@
+ }
+ 
+ #endif	/* _WCN36XX_H_ */
++
+--- a/drivers/net/wireless/ath/wcn36xx/main.c
++++ b/drivers/net/wireless/ath/wcn36xx/main.c
+@@ -243,7 +243,7 @@
+ 		goto out_free_dxe_ctl;
+ 	}
+ 
+-	if (!wcn36xx_is_fw_version(wcn, 1, 2, 2, 24)) {
++	if (!wcn36xx_is_old_fw(wcn)) {
+ 		ret = wcn36xx_smd_feature_caps_exchange(wcn);
+ 		if (ret)
+ 			wcn36xx_warn("Exchange feature caps failed\n");
+--- a/drivers/net/wireless/ath/wcn36xx/smd.c
++++ b/drivers/net/wireless/ath/wcn36xx/smd.c
+@@ -1501,7 +1501,7 @@
+ 
+ 	mutex_lock(&wcn->hal_mutex);
+ 
+-	if (!wcn36xx_is_fw_version(wcn, 1, 2, 2, 24))
++	if (!wcn36xx_is_old_fw(wcn))
+ 		ret = wcn36xx_smd_config_sta_v1(wcn, vif, sta);
+ 	else
+ 		ret = wcn36xx_smd_config_sta_v0(wcn, vif, sta);
+@@ -1828,7 +1828,7 @@
+ 
+ 	mutex_lock(&wcn->hal_mutex);
+ 
+-	if (!wcn36xx_is_fw_version(wcn, 1, 2, 2, 24))
++	if (!wcn36xx_is_old_fw(wcn))
+ 		ret = wcn36xx_smd_config_bss_v1(wcn, vif, sta, bssid, update);
+ 	else
+ 		ret = wcn36xx_smd_config_bss_v0(wcn, vif, sta, bssid, update);
+@@ -2713,7 +2713,7 @@
+ 	struct wcn36xx_vif *tmp;
+ 
+ 	/* Old FW does not have bss index */
+-	if (wcn36xx_is_fw_version(wcn, 1, 2, 2, 24)) {
++	if (wcn36xx_is_old_fw(wcn)) {
+ 		list_for_each_entry(tmp, &wcn->vif_list, list) {
+ 			wcn36xx_dbg(WCN36XX_DBG_HAL, "beacon missed bss_index %d\n",
+ 				    tmp->bss_index);

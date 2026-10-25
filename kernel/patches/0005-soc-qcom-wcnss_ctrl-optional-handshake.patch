@@ -1,0 +1,16 @@
+--- a/drivers/soc/qcom/wcnss_ctrl.c
++++ b/drivers/soc/qcom/wcnss_ctrl.c
+@@ -298,6 +298,13 @@
+ 	bool expect_cbc;
+ 	int ret;
+ 
++	/* pre-2013 Riva firmware (Windows Phone 8) has no WCNSS_CTRL channel;
++	 * wcn36xx downloads the NV itself over WLAN_CTRL, so go straight to populate */
++	if (of_property_read_bool(wcnss->dev->of_node, "lumia,no-ctrl-handshake")) {
++		of_platform_populate(wcnss->dev->of_node, NULL, NULL, wcnss->dev);
++		return;
++	}
++
+ 	ret = wcnss_request_version(wcnss);
+ 	if (ret < 0)
+ 		return;

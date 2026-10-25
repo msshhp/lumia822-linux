@@ -1,0 +1,17 @@
+# build outputs and downloads
+out/
+external/
+tools/dotnet/*/bin/
+tools/dotnet/*/obj/
+*.obj
+*.exe
+*.efi
+
+# never commit these
+loader/sign/
+*.key
+authorized_keys
+wpa_supplicant.conf
+*.ffu
+*.mbn
+backup/

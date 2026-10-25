@@ -1,0 +1,24 @@
+--- a/drivers/clk/qcom/clk-rpm.c
++++ b/drivers/clk/qcom/clk-rpm.c
+@@ -541,6 +541,21 @@
+ 	rcc->num_clks = num_clks;
+ 	mutex_init(&rcc->xo_lock);
+ 
++	/*
++	 * Vote PXO and CXO on for the apps processor, as the downstream msm_xo driver does.
++	 * Without an apps vote the RPM may turn PXO off once another master (e.g. Riva/WCNSS) sends
++	 * its requests, which stops the CPU and timer clocks and hard-locks MSM8960.
++	 */
++	{
++		u32 on = 1; int a, b, c, d;
++		a = qcom_rpm_write(rpm, QCOM_RPM_ACTIVE_STATE, QCOM_RPM_PXO_CLK, &on, 1);
++		b = qcom_rpm_write(rpm, QCOM_RPM_SLEEP_STATE, QCOM_RPM_PXO_CLK, &on, 1);
++		c = qcom_rpm_write(rpm, QCOM_RPM_ACTIVE_STATE, QCOM_RPM_CXO_CLK, &on, 1);
++		d = qcom_rpm_write(rpm, QCOM_RPM_SLEEP_STATE, QCOM_RPM_CXO_CLK, &on, 1);
++		if (a || b || c || d)
++			dev_warn(&pdev->dev, "PXO/CXO vote failed: %d/%d %d/%d\n", a, b, c, d);
++	}
++
+ 	for (i = 0; i < num_clks; i++) {
+ 		if (!rpm_clks[i])
+ 			continue;
